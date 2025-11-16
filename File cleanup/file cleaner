@@ -1,0 +1,60 @@
+import os
+import shutil
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+class FileCleanerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("File Cleaner App")
+        self.root.geometry("500x400")
+
+        # Folder selection
+        tk.Label(root, text="Select folder to clean:").pack(pady=5)
+        self.folder_path = tk.StringVar()
+        tk.Entry(root, textvariable=self.folder_path, width=50).pack(pady=5)
+        tk.Button(root, text="Browse", command=self.browse_folder).pack(pady=5)
+
+        # File types to delete
+        tk.Label(root, text="File extensions to delete (comma separated, e.g., .tmp,.log):").pack(pady=5)
+        self.extensions = tk.StringVar()
+        tk.Entry(root, textvariable=self.extensions, width=50).pack(pady=5)
+
+        # Clean button
+        tk.Button(root, text="Clean Files", command=self.clean_files).pack(pady=20)
+
+        # Log output
+        self.log = tk.Text(root, width=60, height=10)
+        self.log.pack(pady=10)
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder_path.set(folder)
+
+    def clean_files(self):
+        folder = self.folder_path.get()
+        exts = [e.strip() for e in self.extensions.get().split(",")]
+        if not folder or not os.path.exists(folder):
+            messagebox.showerror("Error", "Please select a valid folder")
+            return
+
+        deleted_files = 0
+        for root_dir, dirs, files in os.walk(folder):
+            for file in files:
+                if any(file.endswith(ext) for ext in exts):
+                    file_path = os.path.join(root_dir, file)
+                    try:
+                        os.remove(file_path)
+                        self.log.insert(tk.END, f"Deleted: {file_path}\n")
+                        deleted_files += 1
+                    except Exception as e:
+                        self.log.insert(tk.END, f"Failed: {file_path} ({e})\n")
+
+        messagebox.showinfo("Done", f"Cleaning complete! Deleted {deleted_files} files.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FileCleanerApp(root)
+    root.mainloop()
+

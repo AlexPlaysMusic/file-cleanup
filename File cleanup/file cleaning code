@@ -1,0 +1,284 @@
+import os
+import tempfile
+import threading
+import time
+from send2trash import send2trash
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from ttkthemes import ThemedTk
+from PIL import Image, ImageTk, ImageSequence
+import pystray
+from pystray import MenuItem as item
+import sys
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+# ---------- Animated GIF Widget ----------
+class AnimatedGIF(tk.Label):
+    """Display an animated GIF in Tkinter."""
+    def __init__(self, master, path, delay=100):
+        im = Image.open(path)
+        self.frames = [ImageTk.PhotoImage(frame.copy().convert("RGBA")) for frame in ImageSequence.Iterator(im)]
+        self.delay = delay
+        super().__init__(master, image=self.frames[0])
+        self.idx = 0
+        self.after(self.delay, self.play)
+
+    def play(self):
+        self.config(image=self.frames[self.idx])
+        self.idx = (self.idx + 1) % len(self.frames)
+        self.after(self.delay, self.play)
+
+# ---------- Main App ----------
+class FileCleanerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("💻 Advanced File Cleaner")
+        self.root.geometry("780x680")
+        self.root.resizable(False, False)
+
+        # ---------- Variables ----------
+        self.folders = []
+        self.extensions = tk.StringVar(value=".tmp,.log,.bak")
+        self.delete_empty = tk.BooleanVar()
+        self.use_recycle = tk.BooleanVar()
+        self.schedule_time = tk.IntVar(value=0)
+        self.freed_space = 0
+        self.theme_mode = self.get_system_theme()
+        self.icon_image = "icon.png"  # small 16x16 or 32x32 PNG for system tray
+        self.tray_icon = None
+
+        # ---------- Header ----------
+        self.header = tk.Label(root, text="💻 Advanced File Cleaner", font=("Segoe UI", 20, "bold"))
+        self.header.pack(pady=10)
+
+        # Theme toggle
+        theme_frame = tk.Frame(root)
+        theme_frame.pack(pady=5)
+        tk.Label(theme_frame, text="Theme: ").pack(side="left")
+        self.theme_button = ttk.Button(theme_frame, text="Toggle Theme", command=self.toggle_theme)
+        self.theme_button.pack(side="left")
+
+        # Folder frame
+        folder_frame = ttk.LabelFrame(root, text="Folders to Clean", padding=10)
+        folder_frame.pack(padx=10, pady=5, fill="x")
+
+        self.folder_listbox = tk.Listbox(folder_frame, height=4, width=70)
+        self.folder_listbox.pack(side="left", padx=(0,10))
+        scrollbar = tk.Scrollbar(folder_frame, orient="vertical", command=self.folder_listbox.yview)
+        scrollbar.pack(side="left", fill="y")
+        self.folder_listbox.config(yscrollcommand=scrollbar.set)
+
+        btn_frame = tk.Frame(folder_frame)
+        btn_frame.pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="➕ Add Folder", command=self.add_folder).pack(pady=5, fill="x")
+        ttk.Button(btn_frame, text="❌ Remove Selected", command=self.remove_folder).pack(pady=5, fill="x")
+        ttk.Button(btn_frame, text="⚡ Quick Clean Temp", command=self.quick_clean).pack(pady=5, fill="x")
+
+        # File type frame
+        filetype_frame = ttk.LabelFrame(root, text="File Types to Delete", padding=10)
+        filetype_frame.pack(padx=10, pady=5, fill="x")
+        ttk.Label(filetype_frame, text="Extensions (comma separated):").pack(anchor="w")
+        ttk.Entry(filetype_frame, textvariable=self.extensions, width=50).pack(pady=5, anchor="w")
+
+        # Options frame
+        options_frame = ttk.LabelFrame(root, text="Options", padding=10)
+        options_frame.pack(padx=10, pady=5, fill="x")
+        ttk.Checkbutton(options_frame, text="🗑 Delete empty folders", variable=self.delete_empty).pack(anchor="w")
+        ttk.Checkbutton(options_frame, text="♻ Move files to Recycle Bin", variable=self.use_recycle).pack(anchor="w")
+
+        # Schedule frame
+        schedule_frame = ttk.LabelFrame(root, text="Scheduled Cleaning", padding=10)
+        schedule_frame.pack(padx=10, pady=5, fill="x")
+        schedule_inner = tk.Frame(schedule_frame)
+        schedule_inner.pack(anchor="w")
+        ttk.Label(schedule_inner, text="Interval (minutes):").pack(side="left")
+        ttk.Entry(schedule_inner, textvariable=self.schedule_time, width=10).pack(side="left", padx=5)
+        ttk.Button(schedule_frame, text="⏰ Start Scheduled Cleaning", command=self.start_scheduled_cleaning).pack(pady=5, anchor="w")
+
+        # Clean button
+        self.clean_button = ttk.Button(root, text="🧹 Start Cleaning", command=self.start_clean_thread)
+        self.clean_button.pack(pady=10)
+
+        # Progress bar
+        style = ttk.Style()
+        style.theme_use('breeze')
+        style.configure("green.Horizontal.TProgressbar", troughcolor="#e0e0e0", background="#4caf50", thickness=25)
+        self.progress = ttk.Progressbar(root, style="green.Horizontal.TProgressbar", orient="horizontal", length=700, mode="determinate")
+        self.progress.pack(pady=10)
+
+        # Animated GIF icon
+        self.gif_icon = AnimatedGIF(root, "cleaning.gif")
+        self.gif_icon.pack(pady=5)
+
+        # Log frame
+        log_frame = ttk.LabelFrame(root, text="Log", padding=10)
+        log_frame.pack(padx=10, pady=5, fill="both", expand=True)
+        self.log = tk.Text(log_frame, width=85, height=12, state="normal")
+        self.log.pack(side="left", fill="both", expand=True)
+        scrollbar_log = tk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        scrollbar_log.pack(side="left", fill="y")
+        self.log.config(yscrollcommand=scrollbar_log.set)
+
+        self.apply_theme()
+
+        # ---------- Start system tray icon ----------
+        threading.Thread(target=self.init_tray_icon, daemon=True).start()
+
+    # ---------- Theme ----------
+    def toggle_theme(self):
+        self.theme_mode = "dark" if self.theme_mode=="light" else "light"
+        self.apply_theme()
+
+    def apply_theme(self):
+        bg = "#2e2e2e" if self.theme_mode=="dark" else "#ffffff"
+        fg = "#ffffff" if self.theme_mode=="dark" else "#000000"
+        self.root.configure(bg=bg)
+        self.header.configure(bg=bg, fg=fg)
+        self.log.configure(bg=("#1e1e1e" if self.theme_mode=="dark" else "#f0f0f0"), fg=fg)
+
+    def get_system_theme(self):
+        if sys.platform.startswith("win") and winreg:
+            try:
+                registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
+                key = winreg.OpenKey(registry, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return "light" if value else "dark"
+            except:
+                return "light"
+        return "light"
+
+    # ---------- Folder Management ----------
+    def add_folder(self):
+        folder = filedialog.askdirectory()
+        if folder and folder not in self.folders:
+            self.folders.append(folder)
+            self.folder_listbox.insert(tk.END, folder)
+
+    def remove_folder(self):
+        selected = self.folder_listbox.curselection()
+        for index in reversed(selected):
+            self.folders.pop(index)
+            self.folder_listbox.delete(index)
+
+    def quick_clean(self):
+        temp_dir = tempfile.gettempdir()
+        self.folders = [temp_dir]
+        self.folder_listbox.delete(0, tk.END)
+        self.folder_listbox.insert(tk.END, temp_dir)
+        self.extensions.set(".tmp,.log,.bak")
+        self.start_clean_thread()
+
+    # ---------- Utilities ----------
+    def bytes_to_readable(self, size):
+        for unit in ['B','KB','MB','GB','TB']:
+            if size<1024:
+                return f"{size:.2f} {unit}"
+            size/=1024
+        return f"{size:.2f} PB"
+
+    # ---------- Cleaning ----------
+    def start_clean_thread(self):
+        threading.Thread(target=self.clean_files).start()
+
+    def clean_files(self):
+        self.progress['value'] = 0
+        total_files = self.count_files()
+        if total_files==0:
+            self.show_notification("File Cleaner", "No files to clean.")
+            return
+
+        self.freed_space=0
+        deleted_files=0
+        processed_files=0
+        exts=[e.strip() for e in self.extensions.get().split(",") if e.strip()]
+        self.show_notification("File Cleaner", "Cleaning started.")
+
+        for folder in self.folders:
+            for root_dir, dirs, files in os.walk(folder, topdown=False):
+                for file in files:
+                    if not exts or any(file.endswith(ext) for ext in exts):
+                        file_path=os.path.join(root_dir,file)
+                        try:
+                            file_size=os.path.getsize(file_path)
+                            if self.use_recycle.get():
+                                send2trash(file_path)
+                            else:
+                                os.remove(file_path)
+                            self.freed_space+=file_size
+                            self.log.insert(tk.END,f"Deleted: {file_path}\n")
+                            deleted_files+=1
+                        except Exception as e:
+                            self.log.insert(tk.END,f"Failed: {file_path} ({e})\n")
+                        processed_files+=1
+                        self.progress['value']=(processed_files/total_files)*100
+                        self.root.update_idletasks()
+                        time.sleep(0.01)
+
+                if self.delete_empty.get():
+                    for dir in dirs:
+                        dir_path=os.path.join(root_dir,dir)
+                        try:
+                            if not os.listdir(dir_path):
+                                os.rmdir(dir_path)
+                                self.log.insert(tk.END,f"Deleted empty folder: {dir_path}\n")
+                        except:
+                            pass
+
+        self.show_notification("File Cleaner", f"Cleaning complete!\nDeleted {deleted_files} files.\nFreed: {self.bytes_to_readable(self.freed_space)}")
+        self.progress['value']=0
+
+    def count_files(self):
+        count=0
+        exts=[e.strip() for e in self.extensions.get().split(",") if e.strip()]
+        for folder in self.folders:
+            for root_dir, dirs, files in os.walk(folder):
+                for file in files:
+                    if not exts or any(file.endswith(ext) for ext in exts):
+                        count+=1
+        return count
+
+    # ---------- Scheduled Cleaning ----------
+    def start_scheduled_cleaning(self):
+        interval=self.schedule_time.get()
+        if interval<=0:
+            messagebox.showerror("Error","Enter a valid interval in minutes")
+            return
+        self.show_notification("File Cleaner", f"Scheduled cleaning every {interval} min.")
+        self.schedule_clean(interval)
+
+    def schedule_clean(self,interval):
+        self.start_clean_thread()
+        threading.Timer(interval*60,lambda:self.schedule_clean(interval)).start()
+
+    # ---------- System Tray ----------
+    def init_tray_icon(self):
+        icon_image = Image.open(self.icon_image)
+        menu = (item('Show', lambda: self.show_window()), item('Exit', lambda: self.exit_app()))
+        self.tray_icon = pystray.Icon("FileCleaner", icon_image, "File Cleaner", menu)
+        self.tray_icon.run()
+
+    def show_window(self):
+        self.root.deiconify()
+
+    def exit_app(self):
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.destroy()
+
+    def show_notification(self, title, message):
+        if sys.platform.startswith("win"):
+            from win10toast import ToastNotifier
+            toaster = ToastNotifier()
+            toaster.show_toast(title, message, duration=5, threaded=True)
+        else:
+            print(f"{title}: {message}")  # fallback
+
+# ---------- Run App ----------
+if __name__=="__main__":
+    root=ThemedTk(theme="breeze")
+    app=FileCleanerApp(root)
+    root.mainloop()
